@@ -67,6 +67,32 @@ func TestMultiPacketConnWriteToFallsBackToNextAvailableDERP(t *testing.T) {
 	}
 }
 
+func TestMultiPacketConnWriteToFallsBackAfterDetectedClose(t *testing.T) {
+	first := newFakePacketConn()
+	second := newFakePacketConn()
+	c := testMultiPacketConn(first, second)
+	defer c.Close()
+
+	first.Close()
+
+	n, err := c.WriteTo([]byte("hello"), Addr("peer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len("hello") {
+		t.Fatalf("WriteTo wrote %d bytes, want %d", n, len("hello"))
+	}
+	if got := first.writeCount(); got != 0 {
+		t.Fatalf("first DERP write count = %d, want 0", got)
+	}
+	if got := second.writeCount(); got != 1 {
+		t.Fatalf("second DERP write count = %d, want 1", got)
+	}
+	if conn := c.conn(0); conn != nil {
+		t.Fatal("closed DERP connection was not removed from availability")
+	}
+}
+
 func TestMultiPacketConnReadFromAcceptsPacketsFromAnyDERP(t *testing.T) {
 	c := testMultiPacketConn()
 	defer c.Close()
@@ -192,6 +218,9 @@ func (c *fakePacketConn) ReadFrom([]byte) (int, net.Addr, error) {
 func (c *fakePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return 0, net.ErrClosed
+	}
 	c.writes = append(c.writes, append([]byte(nil), p...))
 	if c.writeErr != nil {
 		return 0, c.writeErr

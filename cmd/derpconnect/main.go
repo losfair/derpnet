@@ -66,21 +66,15 @@ You can find Tailscale hosted DERP server from https://login.tailscale.com/derpm
 		if err != nil {
 			log.Fatalf(`provide a valid port with "derpconnect serve <port>"`)
 		}
-		listeners := make([]net.Listener, 0, len(derpServers))
-		for _, derpServer := range derpServers {
-			l, err := derpConfig.Listen(derpServer, key)
-			if err != nil {
-				log.Fatalf("unable to connect to DERP server %s: %v", derpServer, err)
-			}
-			listeners = append(listeners, l)
+		l, err := derpConfig.ListenAll(derpServers, key)
+		if err != nil {
+			log.Fatalf("unable to connect to any DERP server: %v", err)
 		}
 		log.Printf(`Listening through DERP. Join with "derpconnect --derp=%s join %v"`, strings.Join(derpServers, ","), base64.RawURLEncoding.EncodeToString(pubKey))
-		for _, l := range listeners {
-			go proxyConn(l, func() (net.Conn, error) {
-				return net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
-			})
-		}
-		select {}
+		log.Printf("Monitoring DERP servers: %s", strings.Join(derpServers, ","))
+		proxyConn(l, func() (net.Conn, error) {
+			return net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
+		})
 	case "join":
 		pubkey, err := base64.RawURLEncoding.DecodeString(flag.Arg(1))
 		if err != nil || len(pubkey) != 32 {

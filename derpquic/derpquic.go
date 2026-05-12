@@ -11,6 +11,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/ntnj/derpnet"
@@ -36,6 +37,12 @@ func Listen(derpURL string, key derpnet.Key) (net.Listener, error) {
 	return lc.Listen(derpURL, key)
 }
 
+// ListenAll connects to multiple DERP server URLs with the provided private key.
+func ListenAll(derpURLs []string, key derpnet.Key) (net.Listener, error) {
+	var lc ListenConfig
+	return lc.ListenAll(derpURLs, key)
+}
+
 // Listen connects to a DERP server URL with the provided private key.
 func (lc *ListenConfig) Listen(derpURL string, key derpnet.Key) (net.Listener, error) {
 	derpConfig := lc.derpConfig()
@@ -43,8 +50,24 @@ func (lc *ListenConfig) Listen(derpURL string, key derpnet.Key) (net.Listener, e
 	if err != nil {
 		return nil, err
 	}
+	return NewListenerPacketConn(pkc, key)
+}
+
+// ListenAll connects to multiple DERP server URLs with the provided private key.
+func (lc *ListenConfig) ListenAll(derpURLs []string, key derpnet.Key) (net.Listener, error) {
+	derpConfig := lc.derpConfig()
+	pkc, err := derpConfig.ListenPacketAll(context.Background(), derpURLs, key)
+	if err != nil {
+		return nil, err
+	}
+	return NewListenerPacketConn(pkc, key)
+}
+
+// NewListenerPacketConn creates a Listener over an existing DERP packet connection.
+func NewListenerPacketConn(pkc net.PacketConn, key derpnet.Key) (*Listener, error) {
 	pub, err := key.PublicKey()
 	if err != nil {
+		pkc.Close()
 		return nil, err
 	}
 	tr := &quic.Transport{
@@ -52,6 +75,7 @@ func (lc *ListenConfig) Listen(derpURL string, key derpnet.Key) (net.Listener, e
 	}
 	cert, err := localhostCertificate()
 	if err != nil {
+		pkc.Close()
 		return nil, err
 	}
 	l, err := tr.Listen(&tls.Config{
@@ -59,10 +83,13 @@ func (lc *ListenConfig) Listen(derpURL string, key derpnet.Key) (net.Listener, e
 		Certificates: []tls.Certificate{*cert},
 	}, quicConfig())
 	if err != nil {
+		pkc.Close()
 		return nil, err
 	}
 	ll := &Listener{
 		l:   l,
+		tr:  tr,
+		pkc: pkc,
 		key: cloneBytes(key),
 		pub: cloneBytes(pub),
 		s:   make(chan streamOrError),
@@ -149,10 +176,14 @@ func (d *Dialer) Dial(addr derpnet.PublicKey) (net.Conn, error) {
 
 // Listener implements net.Listener.
 type Listener struct {
-	l   *quic.Listener
-	key derpnet.Key
-	pub derpnet.PublicKey
-	s   chan streamOrError
+	l         *quic.Listener
+	tr        *quic.Transport
+	pkc       net.PacketConn
+	key       derpnet.Key
+	pub       derpnet.PublicKey
+	s         chan streamOrError
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Accept implements net.Listener.
@@ -171,7 +202,18 @@ func (l *Listener) Addr() net.Addr {
 
 // Close implements net.Listener.
 func (l *Listener) Close() error {
-	return l.l.Close()
+	l.closeOnce.Do(func() {
+		if err := l.l.Close(); err != nil && l.closeErr == nil {
+			l.closeErr = err
+		}
+		if err := l.pkc.Close(); err != nil && l.closeErr == nil {
+			l.closeErr = err
+		}
+		if err := l.tr.Close(); err != nil && l.closeErr == nil {
+			l.closeErr = err
+		}
+	})
+	return l.closeErr
 }
 
 type streamOrError struct {
