@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,7 +26,13 @@ import (
 
 var Debug = false
 
-type ListenConfig struct{}
+const maxFrameSize = 1 << 20
+
+type ListenConfig struct {
+	// InsecureDERP disables TLS certificate verification for the DERP server.
+	// This does not affect derpquic's inner peer authentication.
+	InsecureDERP bool
+}
 
 // ListenPacket connects to a DERP server URL with the provided private key.
 // It returns net.PacketConn
@@ -38,6 +45,10 @@ func ListenPacket(derpURL string, key Key) (net.PacketConn, error) {
 
 // ListenPacket connects to a DERP server URL with the provided private key.
 func (lc *ListenConfig) ListenPacket(ctx context.Context, derpURL string, key Key) (net.PacketConn, error) {
+	cfg := ListenConfig{}
+	if lc != nil {
+		cfg = *lc
+	}
 	pub, err := curve25519.X25519(key, curve25519.Basepoint)
 	if err != nil {
 		return nil, err
@@ -50,18 +61,22 @@ func (lc *ListenConfig) ListenPacket(ctx context.Context, derpURL string, key Ke
 		recvT:   time.NewTimer(time.Duration(math.MaxInt64)),
 		closeCh: make(chan struct{}, 1),
 	}
-	if err := handshake(ctx, derpURL, key, conn); err != nil {
+	if err := handshake(ctx, derpURL, key, conn, cfg); err != nil {
 		return nil, err
 	}
 	return conn, nil
 }
 
-func handshake(ctx context.Context, derpURL string, key Key, pc *PacketConn) (retErr error) {
+func handshake(ctx context.Context, derpURL string, key Key, pc *PacketConn, cfg ListenConfig) (retErr error) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
+	dialAddr, serverName, err := derpServerAddr(derpURL)
+	if err != nil {
+		return err
+	}
 	// Connect to DERP
 	var dialer net.Dialer
-	tcpConn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:443", derpURL))
+	tcpConn, err := dialer.DialContext(ctx, "tcp", dialAddr)
 	if err != nil {
 		return err
 	}
@@ -70,7 +85,10 @@ func handshake(ctx context.Context, derpURL string, key Key, pc *PacketConn) (re
 			tcpConn.Close()
 		}
 	}()
-	conn := tls.Client(tcpConn, &tls.Config{ServerName: derpURL})
+	conn := tls.Client(tcpConn, &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: cfg.InsecureDERP,
+	})
 	pc.c = conn
 
 	// Upgrade to DERP protocol
@@ -78,7 +96,6 @@ func handshake(ctx context.Context, derpURL string, key Key, pc *PacketConn) (re
 	if err != nil {
 		return fmt.Errorf("error creating request: %w", err)
 	}
-	req.Header.Set("User-Agent", "ntnj/derpnet")
 	req.Header.Set("Upgrade", "DERP")
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Derp-Fast-Start", "1")
@@ -103,6 +120,7 @@ func handshake(ctx context.Context, derpURL string, key Key, pc *PacketConn) (re
 		for {
 			typ, msg, err := readFrame(pc.brw.Reader)
 			if err != nil {
+				pc.Close()
 				return
 			}
 			switch typ {
@@ -111,7 +129,9 @@ func handshake(ctx context.Context, derpURL string, key Key, pc *PacketConn) (re
 				go func() {
 					pc.mu.Lock()
 					defer pc.mu.Unlock()
-					writeFrame(pc.brw.Writer, framePong, msg)
+					if err := writeFrame(pc.brw.Writer, framePong, msg); err != nil {
+						pc.Close()
+					}
 				}()
 			case frameRecvPacket:
 				select {
@@ -128,6 +148,23 @@ func handshake(ctx context.Context, derpURL string, key Key, pc *PacketConn) (re
 	return err
 }
 
+func derpServerAddr(derpURL string) (dialAddr string, serverName string, err error) {
+	if derpURL == "" {
+		return "", "", errors.New("empty DERP server")
+	}
+	host, port, err := net.SplitHostPort(derpURL)
+	if err == nil {
+		if host == "" || port == "" {
+			return "", "", fmt.Errorf("invalid DERP server address: %q", derpURL)
+		}
+		return net.JoinHostPort(host, port), host, nil
+	}
+	if strings.Contains(derpURL, ":") && !strings.Contains(err.Error(), "missing port in address") && !strings.Contains(err.Error(), "too many colons in address") {
+		return "", "", fmt.Errorf("invalid DERP server address %q: %w", derpURL, err)
+	}
+	return net.JoinHostPort(derpURL, "443"), derpURL, nil
+}
+
 // PacketConn implements net.PacketConn.
 type PacketConn struct {
 	c   net.Conn
@@ -139,7 +176,8 @@ type PacketConn struct {
 	recvCh chan []byte
 	recvT  *time.Timer
 
-	closeCh chan struct{}
+	closeCh   chan struct{}
+	closeOnce sync.Once
 
 	mu sync.Mutex
 }
@@ -165,6 +203,8 @@ func (c *PacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		return n, Addr(msg[:32]), nil
 	case <-c.recvT.C:
 		return 0, nil, os.ErrDeadlineExceeded
+	case <-c.closeCh:
+		return 0, nil, net.ErrClosed
 	}
 }
 
@@ -173,8 +213,18 @@ func (c *PacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if addr.Network() != "derp" {
 		return 0, fmt.Errorf("unsupported protocol: %v", addr.Network())
 	}
+	select {
+	case <-c.closeCh:
+		return 0, net.ErrClosed
+	default:
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	select {
+	case <-c.closeCh:
+		return 0, net.ErrClosed
+	default:
+	}
 	if err := writeFrame(c.brw.Writer, frameSendPacket, []byte(addr.String()), []byte{0}, p); err != nil {
 		return 0, err
 	}
@@ -183,17 +233,13 @@ func (c *PacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 // Close implements net.PacketConn.
 func (c *PacketConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	select {
-	case <-c.closeCh:
-		return nil
-	default:
-	}
-	err := c.c.Close()
-	c.closeCh <- struct{}{}
-	close(c.closeCh)
-	close(c.recvCh)
+	var err error
+	c.closeOnce.Do(func() {
+		close(c.closeCh)
+		if c.c != nil {
+			err = c.c.Close()
+		}
+	})
 	return err
 }
 
@@ -251,6 +297,9 @@ func readFrame(r *bufio.Reader) (frameType, []byte, error) {
 	}
 	typ := frameType(hdr[0])
 	siz := binary.BigEndian.Uint32(hdr[1:5])
+	if siz > maxFrameSize {
+		return 0, nil, fmt.Errorf("frame too large: %d > %d", siz, maxFrameSize)
+	}
 	msg := make([]byte, siz)
 	_, err = io.ReadFull(r, msg)
 	if Debug {
@@ -265,6 +314,9 @@ func writeFrame(w *bufio.Writer, t frameType, msgs ...[]byte) error {
 	size := 0
 	for _, msg := range msgs {
 		size += len(msg)
+		if size > maxFrameSize {
+			return fmt.Errorf("frame too large: %d > %d", size, maxFrameSize)
+		}
 	}
 	binary.BigEndian.PutUint32(hdr[1:5], uint32(size))
 	if _, err := w.Write(hdr); err != nil {

@@ -14,15 +14,17 @@ This project is not affiliated with Tailscale in any way. I've used it to connec
 To install the binary, run:  
 `go install github.com/ntnj/derpnet/cmd/derpconnect@latest`
 
-Find a DERP server closest to you from [here](https://login.tailscale.com/derpmap/default). Use it as the value of `--derp` flags in the commands below.
+Find a DERP server closest to you from [here](https://login.tailscale.com/derpmap/default). Use it as the value of `--derp` flags in the commands below. To override the default DERP TLS port, pass `--derp=<host>:<port>`. To fetch the comma-separated DERP server list from a URL instead, pass `--derp-list=<url>`.
 
 To expose a port running on a server:  
 `derpconnect --derp=... serve <port>`  
-The above command will print a public key, which you can use on different client machine.  
+The above command will print a public key, which you can use on different client machine.
 
 On a client machine, run:  
-`derpconnect --derp=... join <pubkey> <listen_port>`  
-This will start listening on `<listen_port>`, and any connections to that port are forwarded to `<port>` on the server.
+`derpconnect --derp=... join <pubkey> <listen_addr>`  
+This will start listening on `<listen_addr>`, and any connections to that address are forwarded to `<port>` on the server. For compatibility, a bare port listens on `127.0.0.1:<port>`; use an address like `:8080` only if you want to listen on all interfaces.
+
+For self-hosted DERP servers with private or self-signed certificates, `--insecure-derp` disables TLS certificate verification for the DERP server connection only. The inner QUIC link still authenticates peers with their DERP keypairs.
 
 ## Use as a library
 
@@ -38,7 +40,7 @@ n, err := conn.WriteTo(<msg>, <pubkeybytes>)
 n, addr, err := conn.ReadFrom(<bytes>)
 ```
 
-TCP-like semantics are added based on QUIC streams implemented with [quic-go](https://github.com/quic-go/quic-go). 
+TCP-like semantics are added based on QUIC streams implemented with [quic-go](https://github.com/quic-go/quic-go).
 
 On server side:
 
@@ -55,6 +57,7 @@ for {
 ```
 
 On the client:
+
 ```go
 import github.com/ntnj/derpnet/derpquic
 
@@ -69,4 +72,3 @@ conn, err := d.Dial(<pubkeybytes>)
 - It doesn't attempt to establish P2P connections like Tailscale does, so will be limited by DERP server's bandwidth and latency.
 - quic-go [doesn't currently allow](https://github.com/quic-go/quic-go/issues/3385) setting configurable packet size and uses a default of 1200, which causes a large amount of packets to be sent to DERP server for connections sending a lot of data.
 - It doesn't currently handle reconnecting to DERP server in case the connection to the DERP server drops.
-

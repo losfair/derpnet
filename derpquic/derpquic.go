@@ -19,12 +19,31 @@ import (
 
 var Debug = false
 
+const quicIdleTimeout = 300 * time.Second
+
+type ListenConfig struct {
+	// InsecureDERP disables TLS certificate verification for the DERP server.
+	// This does not affect derpquic's inner peer authentication.
+	InsecureDERP bool
+}
+
 // Listen connects to a DERP server URL with the provided private key.
 // It returns net.Listener and implements a TCP-like stream.
 // derpURL should be a valid server name compatible with the Tailscale's DERP protocol.
 // key should have a length of 32 bytes
 func Listen(derpURL string, key derpnet.Key) (net.Listener, error) {
-	pkc, err := derpnet.ListenPacket(derpURL, key)
+	var lc ListenConfig
+	return lc.Listen(derpURL, key)
+}
+
+// Listen connects to a DERP server URL with the provided private key.
+func (lc *ListenConfig) Listen(derpURL string, key derpnet.Key) (net.Listener, error) {
+	derpConfig := lc.derpConfig()
+	pkc, err := derpConfig.ListenPacket(context.Background(), derpURL, key)
+	if err != nil {
+		return nil, err
+	}
+	pub, err := key.PublicKey()
 	if err != nil {
 		return nil, err
 	}
@@ -38,22 +57,24 @@ func Listen(derpURL string, key derpnet.Key) (net.Listener, error) {
 	l, err := tr.Listen(&tls.Config{
 		ServerName:   "localhost",
 		Certificates: []tls.Certificate{*cert},
-	}, &quic.Config{
-		InitialPacketSize: 32 << 10,
-	})
+	}, quicConfig())
 	if err != nil {
 		return nil, err
 	}
 	ll := &Listener{
-		l: l,
-		s: make(chan streamOrError),
+		l:   l,
+		key: cloneBytes(key),
+		pub: cloneBytes(pub),
+		s:   make(chan streamOrError),
 	}
 	go ll.start()
 	return ll, nil
 }
 
 type Dialer struct {
-	tr *quic.Transport
+	tr  *quic.Transport
+	key derpnet.Key
+	pub derpnet.PublicKey
 }
 
 // NewDialer connects to a DERP server URL with the provided private key.
@@ -61,28 +82,66 @@ type Dialer struct {
 // derpURL should be a valid server name compatible with the Tailscale's DERP protocol.
 // key should have a length of 32 bytes
 func NewDialer(derpURL string, key derpnet.Key) (*Dialer, error) {
-	pkc, err := derpnet.ListenPacket(derpURL, key)
+	var lc ListenConfig
+	return lc.NewDialer(derpURL, key)
+}
+
+// NewDialer connects to a DERP server URL with the provided private key.
+func (lc *ListenConfig) NewDialer(derpURL string, key derpnet.Key) (*Dialer, error) {
+	derpConfig := lc.derpConfig()
+	pkc, err := derpConfig.ListenPacket(context.Background(), derpURL, key)
 	if err != nil {
+		return nil, err
+	}
+	return NewDialerPacketConn(pkc, key)
+}
+
+// NewDialerPacketConn creates a Dialer over an existing DERP packet connection.
+func NewDialerPacketConn(pkc net.PacketConn, key derpnet.Key) (*Dialer, error) {
+	pub, err := key.PublicKey()
+	if err != nil {
+		pkc.Close()
 		return nil, err
 	}
 	tr := &quic.Transport{
 		Conn: pkc,
 	}
-	return &Dialer{tr}, nil
+	return &Dialer{tr: tr, key: cloneBytes(key), pub: cloneBytes(pub)}, nil
+}
+
+func quicConfig() *quic.Config {
+	return &quic.Config{
+		InitialPacketSize: 32 << 10,
+		MaxIdleTimeout:    quicIdleTimeout,
+	}
+}
+
+func (lc *ListenConfig) derpConfig() derpnet.ListenConfig {
+	if lc == nil {
+		return derpnet.ListenConfig{}
+	}
+	return derpnet.ListenConfig{InsecureDERP: lc.InsecureDERP}
 }
 
 func (d *Dialer) Dial(addr derpnet.PublicKey) (net.Conn, error) {
 	c, err := d.tr.Dial(context.TODO(), derpnet.Addr(addr), &tls.Config{
+		// The peer uses an ephemeral self-signed certificate. authenticateClient
+		// verifies the expected DERP key and binds that proof to this TLS session.
 		InsecureSkipVerify: true,
-	}, &quic.Config{
-		InitialPacketSize: 32 << 10,
-	})
+	}, quicConfig())
 	if err != nil {
 		return nil, err
 	}
 	// TODO: reuse connection for the same target
 	s, err := c.OpenStreamSync(context.TODO())
 	if err != nil {
+		c.CloseWithError(0, "open stream failed")
+		return nil, err
+	}
+	if err := authenticateClient(c, s, d.key, d.pub, addr); err != nil {
+		s.CancelRead(0)
+		s.CancelWrite(0)
+		c.CloseWithError(0, "authentication failed")
 		return nil, err
 	}
 	return &Connection{c: c, s: s}, nil
@@ -90,8 +149,10 @@ func (d *Dialer) Dial(addr derpnet.PublicKey) (net.Conn, error) {
 
 // Listener implements net.Listener.
 type Listener struct {
-	l *quic.Listener
-	s chan streamOrError
+	l   *quic.Listener
+	key derpnet.Key
+	pub derpnet.PublicKey
+	s   chan streamOrError
 }
 
 // Accept implements net.Listener.
@@ -114,8 +175,8 @@ func (l *Listener) Close() error {
 }
 
 type streamOrError struct {
-	c   quic.Connection
-	s   quic.Stream
+	c   *quic.Conn
+	s   *quic.Stream
 	err error
 }
 
@@ -136,7 +197,7 @@ func (l *Listener) start() {
 			}
 			continue
 		}
-		go func(conn quic.Connection) {
+		go func(conn *quic.Conn) {
 			for {
 				stream, err := conn.AcceptStream(conn.Context())
 				if Debug {
@@ -153,6 +214,13 @@ func (l *Listener) start() {
 					l.s <- streamOrError{err: err}
 					continue
 				}
+				if err := authenticateServer(conn, stream, l.key, l.pub); err != nil {
+					stream.CancelRead(0)
+					stream.CancelWrite(0)
+					conn.CloseWithError(0, "authentication failed")
+					l.s <- streamOrError{err: err}
+					continue
+				}
 				l.s <- streamOrError{c: conn, s: stream}
 			}
 		}(conn)
@@ -163,8 +231,8 @@ var _ net.Listener = (*Listener)(nil)
 
 // Connection implements net.Conn.
 type Connection struct {
-	c quic.Connection
-	s quic.Stream
+	c *quic.Conn
+	s *quic.Stream
 }
 
 // Close implements net.Conn.
