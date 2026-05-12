@@ -28,6 +28,11 @@ var Debug = false
 
 const maxFrameSize = 1 << 20
 
+var (
+	derpPingInterval = 5 * time.Second
+	derpPongTimeout  = 10 * time.Second
+)
+
 type ListenConfig struct {
 	// InsecureDERP disables TLS certificate verification for the DERP server.
 	// This does not affect derpquic's inner peer authentication.
@@ -59,6 +64,7 @@ func (lc *ListenConfig) ListenPacket(ctx context.Context, derpURL string, key Ke
 		// Keep 10 most received packets in client buffer.
 		recvCh:  make(chan []byte, 10),
 		recvT:   time.NewTimer(time.Duration(math.MaxInt64)),
+		pongCh:  make(chan [8]byte, 10),
 		closeCh: make(chan struct{}, 1),
 	}
 	if err := handshake(ctx, derpURL, key, conn, cfg); err != nil {
@@ -116,34 +122,8 @@ func handshake(ctx context.Context, derpURL string, key Key, pc *PacketConn, cfg
 		return err
 	}
 
-	go func() {
-		for {
-			typ, msg, err := readFrame(pc.brw.Reader)
-			if err != nil {
-				pc.Close()
-				return
-			}
-			switch typ {
-			case frameKeepAlive:
-			case framePing:
-				go func() {
-					pc.mu.Lock()
-					defer pc.mu.Unlock()
-					if err := writeFrame(pc.brw.Writer, framePong, msg); err != nil {
-						pc.Close()
-					}
-				}()
-			case frameRecvPacket:
-				select {
-				case pc.recvCh <- msg:
-				default:
-					// Delete oldest element
-					<-pc.recvCh
-					pc.recvCh <- msg
-				}
-			}
-		}
-	}()
+	go pc.readLoop()
+	go pc.heartbeatLoop()
 
 	return err
 }
@@ -175,11 +155,115 @@ type PacketConn struct {
 
 	recvCh chan []byte
 	recvT  *time.Timer
+	pongCh chan [8]byte
 
 	closeCh   chan struct{}
 	closeOnce sync.Once
 
 	mu sync.Mutex
+}
+
+func (c *PacketConn) readLoop() {
+	for {
+		typ, msg, err := readFrame(c.brw.Reader)
+		if err != nil {
+			c.Close()
+			return
+		}
+		switch typ {
+		case frameKeepAlive:
+		case framePing:
+			go c.replyPong(msg)
+		case framePong:
+			if len(msg) != 8 {
+				continue
+			}
+			var ping [8]byte
+			copy(ping[:], msg)
+			select {
+			case c.pongCh <- ping:
+			default:
+			}
+		case frameRecvPacket:
+			select {
+			case c.recvCh <- msg:
+			default:
+				// Delete oldest element.
+				<-c.recvCh
+				c.recvCh <- msg
+			}
+		}
+	}
+}
+
+func (c *PacketConn) replyPong(msg []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := writeFrame(c.brw.Writer, framePong, msg); err != nil {
+		c.Close()
+	}
+}
+
+func (c *PacketConn) heartbeatLoop() {
+	ticker := time.NewTicker(derpPingInterval)
+	defer ticker.Stop()
+
+	timeout := time.NewTimer(time.Duration(math.MaxInt64))
+	defer timeout.Stop()
+
+	outstanding := make(map[[8]byte]time.Time)
+	resetTimeout := func() {
+		if !timeout.Stop() {
+			select {
+			case <-timeout.C:
+			default:
+			}
+		}
+		var earliest time.Time
+		for _, deadline := range outstanding {
+			if earliest.IsZero() || deadline.Before(earliest) {
+				earliest = deadline
+			}
+		}
+		if earliest.IsZero() {
+			timeout.Reset(time.Duration(math.MaxInt64))
+			return
+		}
+		timeout.Reset(time.Until(earliest))
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			var ping [8]byte
+			for {
+				if _, err := io.ReadFull(rand.Reader, ping[:]); err != nil {
+					c.Close()
+					return
+				}
+				if _, exists := outstanding[ping]; !exists {
+					break
+				}
+			}
+			c.mu.Lock()
+			err := writeFrame(c.brw.Writer, framePing, ping[:])
+			c.mu.Unlock()
+			if err != nil {
+				c.Close()
+				return
+			}
+			outstanding[ping] = time.Now().Add(derpPongTimeout)
+			resetTimeout()
+		case pong := <-c.pongCh:
+			delete(outstanding, pong)
+			resetTimeout()
+		case <-timeout.C:
+			c.Close()
+			return
+		case <-c.closeCh:
+			return
+		}
+	}
 }
 
 // ReadFrom implements net.PacketConn.

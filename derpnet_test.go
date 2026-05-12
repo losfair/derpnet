@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReadFrameRejectsOversizedFrame(t *testing.T) {
@@ -77,5 +79,114 @@ func TestDerpServerAddrRejectsInvalidAddress(t *testing.T) {
 	}
 	if _, _, err := derpServerAddr("derp.example.com:"); err == nil {
 		t.Fatal("expected empty DERP port error")
+	}
+}
+
+func TestPacketConnHeartbeatClosesWhenPongTimesOut(t *testing.T) {
+	restoreHeartbeatTimings := setTestHeartbeatTimings(t, 5*time.Millisecond, 20*time.Millisecond)
+	defer restoreHeartbeatTimings()
+
+	pc, server, cleanup := testHeartbeatPacketConn(t)
+	defer cleanup()
+
+	go pc.readLoop()
+	go pc.heartbeatLoop()
+
+	typ, msg, err := readFrame(server.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != framePing {
+		t.Fatalf("heartbeat frame = %v, want %v", typ, framePing)
+	}
+	if len(msg) != 8 {
+		t.Fatalf("heartbeat ping length = %d, want 8", len(msg))
+	}
+	go func() {
+		for {
+			if _, _, err := readFrame(server.Reader); err != nil {
+				return
+			}
+		}
+	}()
+
+	waitUntil(t, func() bool {
+		select {
+		case <-pc.closeCh:
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+func TestPacketConnHeartbeatAcceptsMatchingPong(t *testing.T) {
+	restoreHeartbeatTimings := setTestHeartbeatTimings(t, 5*time.Millisecond, 50*time.Millisecond)
+	defer restoreHeartbeatTimings()
+
+	pc, server, cleanup := testHeartbeatPacketConn(t)
+	defer cleanup()
+
+	go pc.readLoop()
+	go pc.heartbeatLoop()
+
+	typ, msg, err := readFrame(server.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != framePing {
+		t.Fatalf("heartbeat frame = %v, want %v", typ, framePing)
+	}
+	if err := writeFrame(server.Writer, framePong, msg); err != nil {
+		t.Fatal(err)
+	}
+
+	typ, msg, err = readFrame(server.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != framePing {
+		t.Fatalf("second heartbeat frame = %v, want %v", typ, framePing)
+	}
+	if err := writeFrame(server.Writer, framePong, msg); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-pc.closeCh:
+		t.Fatal("connection closed after receiving matching pong")
+	case <-time.After(derpPingInterval):
+	}
+}
+
+func testHeartbeatPacketConn(t *testing.T) (*PacketConn, *bufio.ReadWriter, func()) {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	pc := &PacketConn{
+		c:       clientConn,
+		brw:     bufio.NewReadWriter(bufio.NewReader(clientConn), bufio.NewWriter(clientConn)),
+		recvCh:  make(chan []byte, 10),
+		recvT:   time.NewTimer(time.Hour),
+		pongCh:  make(chan [8]byte, 10),
+		closeCh: make(chan struct{}),
+	}
+	server := bufio.NewReadWriter(bufio.NewReader(serverConn), bufio.NewWriter(serverConn))
+	cleanup := func() {
+		pc.recvT.Stop()
+		pc.Close()
+		serverConn.Close()
+	}
+	return pc, server, cleanup
+}
+
+func setTestHeartbeatTimings(t *testing.T, interval, timeout time.Duration) func() {
+	t.Helper()
+	oldInterval := derpPingInterval
+	oldTimeout := derpPongTimeout
+	derpPingInterval = interval
+	derpPongTimeout = timeout
+	return func() {
+		derpPingInterval = oldInterval
+		derpPongTimeout = oldTimeout
 	}
 }
