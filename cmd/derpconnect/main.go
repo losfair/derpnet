@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -25,13 +24,14 @@ import (
 var (
 	derpServer   = flag.String("derp", "", "comma-separated list of derp servers to use, optionally host:port")
 	derpListURL  = flag.String("derp-list", "", "url returning a comma-separated list of derp servers to use")
-	keyName      = flag.String("key", "derpconnect", "key file to use")
 	debug        = flag.Bool("debug", false, "enable debug logging")
 	insecureDERP = flag.Bool("insecure-derp", false, "disable TLS certificate verification for the DERP server")
 	fwmark       = flag.Uint("fwmark", 0, "Linux only: set SO_MARK on outgoing TCP connections to DERP servers")
 )
 
 var derpDialRetryInterval = time.Second
+
+const keyEnvVar = "DERPCONNECT_X25519_PRIVATE_KEY"
 
 func main() {
 	flag.Parse()
@@ -61,9 +61,9 @@ You can find Tailscale hosted DERP server from https://login.tailscale.com/derpm
 		log.Fatal(err)
 	}
 	derpConfig := derpquic.ListenConfig{InsecureDERP: *insecureDERP, FWMark: fwmarkValue}
-	key, err := getKey(*keyName)
+	key, err := getKey()
 	if err != nil {
-		log.Fatalf("unable to generate key: %v", err)
+		log.Fatalf("unable to load key: %v", err)
 	}
 
 	switch flag.Arg(0) {
@@ -331,39 +331,40 @@ func closeWrite(conn net.Conn) {
 	}
 }
 
-func getKey(name string) (derpnet.Key, error) {
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		return ephemeralKey("unable to find config dir: %v", err)
-	}
-	keyPath := filepath.Join(configDir, "derpconnect", name)
-	if bytes, err := os.ReadFile(keyPath); err == nil {
-		if len(bytes) != 32 {
-			return ephemeralKey("invalid key length found in %s: %d", keyPath, len(bytes))
-		}
-		return bytes, nil
-	} else if !os.IsNotExist(err) {
-		return ephemeralKey("unable to read existing key from %s: %v", keyPath, err)
+func getKey() (derpnet.Key, error) {
+	encoded := os.Getenv(keyEnvVar)
+	if encoded == "" {
+		log.Printf("%s not set; using ephemeral key", keyEnvVar)
+		return ephemeralKey()
 	}
 
-	key, err := derpnet.GenerateKey()
+	key, err := decodeKey(encoded)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate key: %w", err)
-	}
-
-	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
-		log.Printf("Unable to create key dir: %v; using ephemeral key", err)
-		return key, nil
-	}
-	if err := os.WriteFile(keyPath, key, 0o400); err != nil {
-		log.Printf("Unable to save key: %v; using ephemeral key", err)
-		return key, nil
+		return nil, fmt.Errorf("invalid %s: %w", keyEnvVar, err)
 	}
 	return key, nil
 }
 
-func ephemeralKey(format string, args ...any) (derpnet.Key, error) {
-	log.Printf(format+"; using ephemeral key", args...)
+func decodeKey(encoded string) (derpnet.Key, error) {
+	for _, encoding := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		key, err := encoding.DecodeString(encoded)
+		if err == nil {
+			if len(key) != 32 {
+				return nil, fmt.Errorf("decoded key length = %d, want 32", len(key))
+			}
+			return key, nil
+		}
+	}
+
+	return nil, errors.New("expected base64-encoded 32-byte x25519 private key")
+}
+
+func ephemeralKey() (derpnet.Key, error) {
 	key, err := derpnet.GenerateKey()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate ephemeral key: %w", err)

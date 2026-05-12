@@ -2,12 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -195,11 +194,23 @@ func TestFetchDERPServerListRejectsHTTPError(t *testing.T) {
 	}
 }
 
-func TestGetKeyFallsBackToEphemeralWithoutConfigDir(t *testing.T) {
-	t.Setenv("HOME", "")
-	t.Setenv("XDG_CONFIG_HOME", "")
+func TestGetKeyFromEnv(t *testing.T) {
+	want := bytes.Repeat([]byte{7}, 32)
+	t.Setenv(keyEnvVar, base64.StdEncoding.EncodeToString(want))
 
-	key, err := getKey("test-key")
+	got, err := getKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("getKey() = %x, want %x", got, want)
+	}
+}
+
+func TestGetKeyGeneratesEphemeralWhenEnvMissing(t *testing.T) {
+	t.Setenv(keyEnvVar, "")
+
+	key, err := getKey()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,19 +219,11 @@ func TestGetKeyFallsBackToEphemeralWithoutConfigDir(t *testing.T) {
 	}
 }
 
-func TestGetKeyFallsBackToEphemeralWhenPersistFails(t *testing.T) {
-	configFile := filepath.Join(t.TempDir(), "config-file")
-	if err := os.WriteFile(configFile, []byte("not a directory"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("XDG_CONFIG_HOME", configFile)
+func TestGetKeyRejectsInvalidEnv(t *testing.T) {
+	t.Setenv(keyEnvVar, base64.StdEncoding.EncodeToString([]byte("too short")))
 
-	key, err := getKey("test-key")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(key) != 32 {
-		t.Fatalf("key length = %d, want 32", len(key))
+	if _, err := getKey(); err == nil {
+		t.Fatal("expected invalid key error")
 	}
 }
 
