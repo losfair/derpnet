@@ -20,7 +20,10 @@ import (
 
 var Debug = false
 
-const quicIdleTimeout = 300 * time.Second
+const (
+	quicKeepAlivePeriod = 15 * time.Second
+	quicIdleTimeout     = 60 * time.Second
+)
 
 type ListenConfig struct {
 	// InsecureDERP disables TLS certificate verification for the DERP server.
@@ -144,6 +147,7 @@ func quicConfig() *quic.Config {
 	return &quic.Config{
 		InitialPacketSize: 32 << 10,
 		MaxIdleTimeout:    quicIdleTimeout,
+		KeepAlivePeriod:   quicKeepAlivePeriod,
 	}
 }
 

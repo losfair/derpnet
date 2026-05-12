@@ -38,6 +38,80 @@ func TestMultiPacketConnWriteToUsesFirstAvailableDERP(t *testing.T) {
 	}
 }
 
+func TestMultiPacketConnWriteToUsesLastIngressDERP(t *testing.T) {
+	first := newFakePacketConn()
+	second := newFakePacketConn()
+	c := testMultiPacketConn(first, second)
+	defer c.Close()
+	c.rememberIngressSlot(1, Addr("peer"))
+
+	n, err := c.WriteTo([]byte("hello"), Addr("peer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len("hello") {
+		t.Fatalf("WriteTo wrote %d bytes, want %d", n, len("hello"))
+	}
+	if got := first.writeCount(); got != 0 {
+		t.Fatalf("first DERP write count = %d, want 0", got)
+	}
+	if got := second.writeCount(); got != 1 {
+		t.Fatalf("second DERP write count = %d, want 1", got)
+	}
+}
+
+func TestMultiPacketConnWriteToUpdatesLastIngressDERP(t *testing.T) {
+	first := newFakePacketConn()
+	second := newFakePacketConn()
+	c := testMultiPacketConn(first, second)
+	defer c.Close()
+	c.rememberIngressSlot(1, Addr("peer"))
+	c.rememberIngressSlot(0, Addr("peer"))
+
+	n, err := c.WriteTo([]byte("hello"), Addr("peer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len("hello") {
+		t.Fatalf("WriteTo wrote %d bytes, want %d", n, len("hello"))
+	}
+	if got := first.writeCount(); got != 1 {
+		t.Fatalf("first DERP write count = %d, want 1", got)
+	}
+	if got := second.writeCount(); got != 0 {
+		t.Fatalf("second DERP write count = %d, want 0", got)
+	}
+}
+
+func TestMultiPacketConnWriteToFallsBackAfterLastIngressDERPFails(t *testing.T) {
+	first := newFakePacketConn()
+	second := newFakePacketConn()
+	second.writeErr = errors.New("write failed")
+	c := testMultiPacketConn(first, second)
+	defer c.Close()
+	c.rememberIngressSlot(1, Addr("peer"))
+
+	n, err := c.WriteTo([]byte("hello"), Addr("peer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len("hello") {
+		t.Fatalf("WriteTo wrote %d bytes, want %d", n, len("hello"))
+	}
+	if got := first.writeCount(); got != 1 {
+		t.Fatalf("first DERP write count = %d, want 1", got)
+	}
+	if got := second.writeCount(); got != 1 {
+		t.Fatalf("second DERP write count = %d, want 1", got)
+	}
+	if !second.isClosed() {
+		t.Fatal("failed last-ingress DERP connection was not closed")
+	}
+	if conn := c.conn(1); conn != nil {
+		t.Fatal("failed last-ingress DERP connection was not removed from availability")
+	}
+}
+
 func TestMultiPacketConnWriteToFallsBackToNextAvailableDERP(t *testing.T) {
 	writeErr := errors.New("write failed")
 	first := newFakePacketConn()
@@ -205,6 +279,7 @@ func testMultiPacketConn(conns ...net.PacketConn) *multiPacketConn {
 	}
 	return &multiPacketConn{
 		slots:   slots,
+		peers:   make(map[string]int),
 		recvCh:  make(chan packetRead, 10),
 		recvT:   time.NewTimer(time.Hour),
 		closeCh: make(chan struct{}),

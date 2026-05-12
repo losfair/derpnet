@@ -30,8 +30,9 @@ func IsNoAvailableDERP(err error) bool {
 type listenPacketFunc func(context.Context, string, Key) (net.PacketConn, error)
 
 // ListenPacketAll connects to multiple DERP servers with the provided private key.
-// Incoming packets are accepted from all available DERP servers, while outgoing
-// packets are sent through the first available server in derpURLs order.
+// Incoming packets are accepted from all available DERP servers. Outgoing
+// packets prefer the peer's last ingress DERP server, then fall back to the
+// first available server in derpURLs order.
 func (lc *ListenConfig) ListenPacketAll(ctx context.Context, derpURLs []string, key Key) (net.PacketConn, error) {
 	cfg := ListenConfig{}
 	if lc != nil {
@@ -45,6 +46,7 @@ type multiPacketConn struct {
 	pub    [32]byte
 	dial   listenPacketFunc
 	slots  []derpSlot
+	peers  map[string]int
 	recvCh chan packetRead
 	recvT  *time.Timer
 
@@ -84,6 +86,7 @@ func newMultiPacketConn(ctx context.Context, derpURLs []string, key Key, dial li
 		pub:     [32]byte(pub),
 		dial:    dial,
 		slots:   make([]derpSlot, len(derpURLs)),
+		peers:   make(map[string]int),
 		recvCh:  make(chan packetRead, 10),
 		recvT:   time.NewTimer(time.Duration(math.MaxInt64)),
 		ctx:     ctx,
@@ -124,7 +127,7 @@ func (c *multiPacketConn) monitor(i int) {
 			log.Printf("derpnet: DERP %s available", server)
 		}
 
-		if err := c.readLoop(conn); err != nil && !errors.Is(err, net.ErrClosed) && Debug {
+		if err := c.readLoop(i, conn); err != nil && !errors.Is(err, net.ErrClosed) && Debug {
 			log.Printf("derpnet: DERP %s disconnected: %v", server, err)
 		}
 		c.clearConn(i, conn)
@@ -165,13 +168,14 @@ func (c *multiPacketConn) clearConn(i int, conn net.PacketConn) {
 	}
 }
 
-func (c *multiPacketConn) readLoop(conn net.PacketConn) error {
+func (c *multiPacketConn) readLoop(i int, conn net.PacketConn) error {
 	buf := make([]byte, maxFrameSize)
 	for {
 		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {
 			return err
 		}
+		c.rememberIngressSlot(i, addr)
 		b := append([]byte(nil), buf[:n]...)
 		select {
 		case c.recvCh <- packetRead{b: b, addr: addr}:
@@ -210,23 +214,69 @@ func (c *multiPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return 0, fmt.Errorf("unsupported protocol: %v", addr.Network())
 	}
 	var errs []error
-	for i := range c.slots {
-		conn := c.conn(i)
-		if conn == nil {
-			continue
-		}
-		n, err := conn.WriteTo(p, addr)
+	preferred, hasPreferred := c.preferredSlot(addr)
+	if hasPreferred {
+		n, err := c.writeToSlot(preferred, p, addr)
 		if err == nil {
 			return n, nil
 		}
-		errs = append(errs, fmt.Errorf("%s: %w", c.slots[i].server, err))
-		c.clearConn(i, conn)
-		conn.Close()
+		if !errors.Is(err, ErrNoAvailableDERP) {
+			errs = append(errs, err)
+		}
+	}
+	for i := range c.slots {
+		if hasPreferred && i == preferred {
+			continue
+		}
+		n, err := c.writeToSlot(i, p, addr)
+		if err == nil {
+			return n, nil
+		}
+		if !errors.Is(err, ErrNoAvailableDERP) {
+			errs = append(errs, err)
+		}
 	}
 	if len(errs) > 0 {
 		return 0, errors.Join(errs...)
 	}
 	return 0, ErrNoAvailableDERP
+}
+
+func (c *multiPacketConn) writeToSlot(i int, p []byte, addr net.Addr) (n int, err error) {
+	if i < 0 || i >= len(c.slots) {
+		return 0, ErrNoAvailableDERP
+	}
+	conn := c.conn(i)
+	if conn == nil {
+		return 0, ErrNoAvailableDERP
+	}
+	n, err = conn.WriteTo(p, addr)
+	if err == nil {
+		return n, nil
+	}
+	c.clearConn(i, conn)
+	conn.Close()
+	return 0, fmt.Errorf("%s: %w", c.slots[i].server, err)
+}
+
+func (c *multiPacketConn) rememberIngressSlot(i int, addr net.Addr) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.peers == nil {
+		c.peers = make(map[string]int)
+	}
+	c.peers[addrKey(addr)] = i
+}
+
+func (c *multiPacketConn) preferredSlot(addr net.Addr) (int, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	i, ok := c.peers[addrKey(addr)]
+	return i, ok
+}
+
+func addrKey(addr net.Addr) string {
+	return addr.Network() + "\x00" + addr.String()
 }
 
 func (c *multiPacketConn) conn(i int) net.PacketConn {
