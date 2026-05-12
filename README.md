@@ -24,6 +24,9 @@ On a client machine, run:
 `derpconnect --derp=... join <pubkey> <listen_addr>`  
 This will start listening on `<listen_addr>`, and any connections to that address are forwarded to `<port>` on the server. For compatibility, a bare port listens on `127.0.0.1:<port>`; use an address like `:8080` only if you want to listen on all interfaces.
 
+To connect a single stream directly over stdin/stdout instead of opening a local listener, use `stdio` as the address:  
+`derpconnect --derp=... join <pubkey> stdio`
+
 For self-hosted DERP servers with private or self-signed certificates, `--insecure-derp` disables TLS certificate verification for the DERP server connection only. The inner QUIC link still authenticates peers with their DERP keypairs.
 
 ## Use as a library

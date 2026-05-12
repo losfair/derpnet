@@ -1,11 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/ntnj/derpnet"
 )
 
 func TestListenAddr(t *testing.T) {
@@ -36,6 +43,84 @@ func TestListenAddr(t *testing.T) {
 func TestListenAddrRejectsInvalidAddress(t *testing.T) {
 	if _, err := listenAddr("localhost"); err == nil {
 		t.Fatal("expected invalid listen address error")
+	}
+}
+
+func TestStdioAddr(t *testing.T) {
+	if !isStdioAddr("stdio") {
+		t.Fatal("stdio should enable stdio mode")
+	}
+	if isStdioAddr("STDIO") {
+		t.Fatal("stdio mode should require exact stdio address")
+	}
+}
+
+func TestPipeConnCopiesStdioToStreamAndStreamToStdout(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	serverDone := make(chan string, 1)
+	go func() {
+		defer server.Close()
+
+		request := make([]byte, len("request from stdin"))
+		_, err := io.ReadFull(server, request)
+		if err != nil {
+			serverDone <- err.Error()
+			return
+		}
+		if _, err := server.Write([]byte("response from stream")); err != nil {
+			serverDone <- err.Error()
+			return
+		}
+		serverDone <- string(request)
+	}()
+
+	var stdout bytes.Buffer
+	if err := pipeConn(strings.NewReader("request from stdin"), &stdout, client); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := stdout.String(), "response from stream"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if got, want := <-serverDone, "request from stdin"; got != want {
+		t.Fatalf("server read = %q, want %q", got, want)
+	}
+}
+
+func TestDialWhenDERPAvailableRetriesUntilAvailable(t *testing.T) {
+	restoreRetryInterval := setTestDialRetryInterval(t)
+	defer restoreRetryInterval()
+
+	var attempts int
+	client, server := net.Pipe()
+	defer server.Close()
+
+	conn, err := dialWhenDERPAvailable(func() (net.Conn, error) {
+		attempts++
+		if attempts < 3 {
+			return nil, derpnet.ErrNoAvailableDERP
+		}
+		return client, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if attempts != 3 {
+		t.Fatalf("dial attempts = %d, want 3", attempts)
+	}
+}
+
+func TestDialWhenDERPAvailableReturnsOtherErrors(t *testing.T) {
+	restoreRetryInterval := setTestDialRetryInterval(t)
+	defer restoreRetryInterval()
+
+	want := io.ErrUnexpectedEOF
+	_, err := dialWhenDERPAvailable(func() (net.Conn, error) {
+		return nil, want
+	})
+	if err != want {
+		t.Fatalf("dialWhenDERPAvailable error = %v, want %v", err, want)
 	}
 }
 
@@ -114,5 +199,14 @@ func TestGetKeyFallsBackToEphemeralWhenPersistFails(t *testing.T) {
 	}
 	if len(key) != 32 {
 		t.Fatalf("key length = %d, want 32", len(key))
+	}
+}
+
+func setTestDialRetryInterval(t *testing.T) func() {
+	t.Helper()
+	old := derpDialRetryInterval
+	derpDialRetryInterval = time.Millisecond
+	return func() {
+		derpDialRetryInterval = old
 	}
 }

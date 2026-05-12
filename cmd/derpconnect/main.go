@@ -29,6 +29,8 @@ var (
 	insecureDERP = flag.Bool("insecure-derp", false, "disable TLS certificate verification for the DERP server")
 )
 
+var derpDialRetryInterval = time.Second
+
 func main() {
 	flag.Parse()
 	if *debug {
@@ -80,13 +82,17 @@ You can find Tailscale hosted DERP server from https://login.tailscale.com/derpm
 		if err != nil || len(pubkey) != 32 {
 			log.Fatalf(`provide correct public key of server with "derpconnect join <pubkey>": %v`, err)
 		}
-		listenAddr, err := listenAddr(flag.Arg(2))
-		if err != nil {
-			log.Fatalf("unable to get address to listen on: %v", err)
-		}
-		l, err := net.Listen("tcp", listenAddr)
-		if err != nil {
-			log.Fatalf("unable to listen locally on %s: %v", listenAddr, err)
+		stdio := isStdioAddr(flag.Arg(2))
+		var l net.Listener
+		if !stdio {
+			localListenAddr, err := listenAddr(flag.Arg(2))
+			if err != nil {
+				log.Fatalf("unable to get address to listen on: %v", err)
+			}
+			l, err = net.Listen("tcp", localListenAddr)
+			if err != nil {
+				log.Fatalf("unable to listen locally on %s: %v", localListenAddr, err)
+			}
 		}
 		derpPacketConfig := derpnet.ListenConfig{InsecureDERP: *insecureDERP}
 		pkc, err := derpPacketConfig.ListenPacketAll(context.Background(), derpServers, key)
@@ -102,17 +108,33 @@ You can find Tailscale hosted DERP server from https://login.tailscale.com/derpm
 		if err != nil {
 			log.Fatalf("unable to get client public key: %v", err)
 		}
+		if stdio {
+			defer pkc.Close()
+			log.Printf("Piping stdio through DERP")
+			log.Printf("Monitoring DERP servers: %s", strings.Join(derpServers, ","))
+			log.Printf("Client public key: %v", base64.RawURLEncoding.EncodeToString(clientPubKey))
+			if err := pipeStdio(func() (net.Conn, error) {
+				return dialWhenDERPAvailable(func() (net.Conn, error) {
+					return d.Dial(pubkey)
+				})
+			}, os.Stdin, os.Stdout); err != nil {
+				log.Fatalf("stdio pipe failed: %v", err)
+			}
+			return
+		}
 		log.Printf("Listening on %v", l.Addr())
 		log.Printf("Monitoring DERP servers: %s", strings.Join(derpServers, ","))
 		log.Printf("Client public key: %v", base64.RawURLEncoding.EncodeToString(clientPubKey))
 		proxyConn(l, func() (net.Conn, error) {
-			return d.Dial(pubkey)
+			return dialWhenDERPAvailable(func() (net.Conn, error) {
+				return d.Dial(pubkey)
+			})
 		})
 	case "internaltest":
 		internalTesting(derpServers[0])
 	default:
 		log.Println(`Run "derpconnect --derp=... serve <port>" on server
-Run "derpconnect --derp=... join <pubkey> <listen_addr>" to connect client to server`)
+Run "derpconnect --derp=... join <pubkey> <listen_addr|stdio>" to connect client to server`)
 	}
 }
 
@@ -160,6 +182,78 @@ func listenAddr(arg string) (string, error) {
 		return "", fmt.Errorf("provide a valid listen address such as 127.0.0.1:8080 or :8080: %w", err)
 	}
 	return arg, nil
+}
+
+func isStdioAddr(arg string) bool {
+	return arg == "stdio"
+}
+
+func pipeStdio(dial func() (net.Conn, error), stdin io.Reader, stdout io.Writer) error {
+	conn, err := dial()
+	if err != nil {
+		return err
+	}
+	return pipeConn(stdin, stdout, conn)
+}
+
+func dialWhenDERPAvailable(dial func() (net.Conn, error)) (net.Conn, error) {
+	var logged bool
+	for {
+		conn, err := dial()
+		if err == nil {
+			if logged {
+				log.Printf("DERP server available; connected stream")
+			}
+			return conn, nil
+		}
+		if !derpnet.IsNoAvailableDERP(err) {
+			return nil, err
+		}
+		if !logged {
+			log.Printf("No DERP servers available yet; waiting")
+			logged = true
+		}
+		time.Sleep(derpDialRetryInterval)
+	}
+}
+
+type copyResult struct {
+	name string
+	err  error
+}
+
+func pipeConn(stdin io.Reader, stdout io.Writer, conn net.Conn) error {
+	defer conn.Close()
+
+	results := make(chan copyResult, 2)
+	go func() {
+		_, err := io.Copy(conn, stdin)
+		closeWrite(conn)
+		results <- copyResult{name: "stdin", err: err}
+	}()
+	go func() {
+		_, err := io.Copy(stdout, conn)
+		closeRead(conn)
+		results <- copyResult{name: "stdout", err: err}
+	}()
+
+	first := <-results
+	firstErr := pipeCopyError(first)
+	if first.name == "stdout" {
+		conn.Close()
+		return firstErr
+	}
+
+	second := <-results
+	secondErr := pipeCopyError(second)
+	return errors.Join(firstErr, secondErr)
+}
+
+func pipeCopyError(result copyResult) error {
+	if result.err == nil || errors.Is(result.err, io.EOF) || errors.Is(result.err, net.ErrClosed) || errors.Is(result.err, io.ErrClosedPipe) {
+		return nil
+	}
+	return fmt.Errorf("%s copy failed: %w", result.name, result.err)
 }
 
 func proxyConn(l net.Listener, dial func() (net.Conn, error)) {

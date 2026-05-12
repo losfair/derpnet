@@ -93,6 +93,22 @@ func TestMultiPacketConnWriteToFallsBackAfterDetectedClose(t *testing.T) {
 	}
 }
 
+func TestIsNoAvailableDERP(t *testing.T) {
+	c := testMultiPacketConn()
+	defer c.Close()
+
+	_, err := c.WriteTo([]byte("hello"), Addr("peer"))
+	if err == nil {
+		t.Fatal("expected no available DERP error")
+	}
+	if !IsNoAvailableDERP(err) {
+		t.Fatalf("IsNoAvailableDERP(%v) = false, want true", err)
+	}
+	if IsNoAvailableDERP(errors.New("other error")) {
+		t.Fatal("IsNoAvailableDERP returned true for unrelated error")
+	}
+}
+
 func TestMultiPacketConnReadFromAcceptsPacketsFromAnyDERP(t *testing.T) {
 	c := testMultiPacketConn()
 	defer c.Close()

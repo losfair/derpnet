@@ -17,7 +17,15 @@ import (
 
 var derpReconnectInterval = 5 * time.Second
 
-var errNoAvailableDERP = errors.New("no available DERP servers")
+// ErrNoAvailableDERP means no monitored DERP server is currently connected.
+// ListenPacketAll keeps reconnecting in the background after this error.
+var ErrNoAvailableDERP = errors.New("no available DERP servers")
+
+// IsNoAvailableDERP reports whether err means no monitored DERP server is
+// currently connected. ListenPacketAll keeps reconnecting in the background.
+func IsNoAvailableDERP(err error) bool {
+	return errors.Is(err, ErrNoAvailableDERP)
+}
 
 type listenPacketFunc func(context.Context, string, Key) (net.PacketConn, error)
 
@@ -218,7 +226,7 @@ func (c *multiPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if len(errs) > 0 {
 		return 0, errors.Join(errs...)
 	}
-	return 0, errNoAvailableDERP
+	return 0, ErrNoAvailableDERP
 }
 
 func (c *multiPacketConn) conn(i int) net.PacketConn {
