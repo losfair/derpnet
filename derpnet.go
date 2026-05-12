@@ -37,6 +37,10 @@ type ListenConfig struct {
 	// InsecureDERP disables TLS certificate verification for the DERP server.
 	// This does not affect derpquic's inner peer authentication.
 	InsecureDERP bool
+
+	// FWMark sets SO_MARK on outgoing TCP connections to DERP servers.
+	// It is supported only on Linux.
+	FWMark uint32
 }
 
 // ListenPacket connects to a DERP server URL with the provided private key.
@@ -82,6 +86,9 @@ func handshake(ctx context.Context, derpURL string, key Key, pc *PacketConn, cfg
 	}
 	// Connect to DERP
 	var dialer net.Dialer
+	if err := setDialerFWMark(&dialer, cfg.FWMark); err != nil {
+		return err
+	}
 	tcpConn, err := dialer.DialContext(ctx, "tcp", dialAddr)
 	if err != nil {
 		return err

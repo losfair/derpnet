@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,7 @@ var (
 	keyName      = flag.String("key", "derpconnect", "key file to use")
 	debug        = flag.Bool("debug", false, "enable debug logging")
 	insecureDERP = flag.Bool("insecure-derp", false, "disable TLS certificate verification for the DERP server")
+	fwmark       = flag.Uint("fwmark", 0, "Linux only: set SO_MARK on outgoing TCP connections to DERP servers")
 )
 
 var derpDialRetryInterval = time.Second
@@ -37,9 +39,15 @@ func main() {
 		derpnet.Debug = true
 		derpquic.Debug = true
 	}
+	fwmarkValue, err := fwmarkFromFlag(*fwmark, runtime.GOOS)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := derpnet.ValidateFWMark(fwmarkValue); err != nil {
+		log.Fatalf("unable to use -fwmark: %v", err)
+	}
 	derpServerArg := *derpServer
 	if *derpListURL != "" {
-		var err error
 		derpServerArg, err = fetchDERPServerList(*derpListURL)
 		if err != nil {
 			log.Fatalf("unable to fetch DERP server list from %s: %v", *derpListURL, err)
@@ -52,7 +60,7 @@ You can find Tailscale hosted DERP server from https://login.tailscale.com/derpm
 	if err != nil {
 		log.Fatal(err)
 	}
-	derpConfig := derpquic.ListenConfig{InsecureDERP: *insecureDERP}
+	derpConfig := derpquic.ListenConfig{InsecureDERP: *insecureDERP, FWMark: fwmarkValue}
 	key, err := getKey(*keyName)
 	if err != nil {
 		log.Fatalf("unable to generate key: %v", err)
@@ -94,7 +102,7 @@ You can find Tailscale hosted DERP server from https://login.tailscale.com/derpm
 				log.Fatalf("unable to listen locally on %s: %v", localListenAddr, err)
 			}
 		}
-		derpPacketConfig := derpnet.ListenConfig{InsecureDERP: *insecureDERP}
+		derpPacketConfig := derpnet.ListenConfig{InsecureDERP: *insecureDERP, FWMark: fwmarkValue}
 		pkc, err := derpPacketConfig.ListenPacketAll(context.Background(), derpServers, key)
 		if err != nil {
 			log.Fatalf("unable to connect to any DERP server: %v", err)
@@ -182,6 +190,19 @@ func listenAddr(arg string) (string, error) {
 		return "", fmt.Errorf("provide a valid listen address such as 127.0.0.1:8080 or :8080: %w", err)
 	}
 	return arg, nil
+}
+
+func fwmarkFromFlag(mark uint, goos string) (uint32, error) {
+	if mark == 0 {
+		return 0, nil
+	}
+	if goos != "linux" {
+		return 0, fmt.Errorf("-fwmark is only supported on Linux")
+	}
+	if mark > uint(^uint32(0)) {
+		return 0, fmt.Errorf("-fwmark must be between 0 and %d", uint(^uint32(0)))
+	}
+	return uint32(mark), nil
 }
 
 func isStdioAddr(arg string) bool {
@@ -351,7 +372,11 @@ func ephemeralKey(format string, args ...any) (derpnet.Key, error) {
 }
 
 func internalTesting(derpServer string) {
-	derpConfig := derpnet.ListenConfig{InsecureDERP: *insecureDERP}
+	fwmarkValue, err := fwmarkFromFlag(*fwmark, runtime.GOOS)
+	if err != nil {
+		log.Fatal(err)
+	}
+	derpConfig := derpnet.ListenConfig{InsecureDERP: *insecureDERP, FWMark: fwmarkValue}
 	key1 := [32]byte{'h', 'e'}
 	key2 := [32]byte{'e', 'f'}
 	var pkey1, pkey2 [32]byte

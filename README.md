@@ -15,6 +15,7 @@ To install the binary, run:
 `go install github.com/ntnj/derpnet/cmd/derpconnect@latest`
 
 Find a DERP server closest to you from [here](https://login.tailscale.com/derpmap/default). Use it as the value of `--derp` flags in the commands below. To override the default DERP TLS port, pass `--derp=<host>:<port>`. To fetch the comma-separated DERP server list from a URL instead, pass `--derp-list=<url>`.
+On Linux, pass `--fwmark=<mark>` to set `SO_MARK` on outgoing TCP connections to DERP servers.
 
 To expose a port running on a server:  
 `derpconnect --derp=... serve <port>`  

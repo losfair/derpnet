@@ -46,6 +46,28 @@ func TestListenAddrRejectsInvalidAddress(t *testing.T) {
 	}
 }
 
+func TestFWMarkFromFlag(t *testing.T) {
+	got, err := fwmarkFromFlag(123, "linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 123 {
+		t.Fatalf("fwmarkFromFlag = %d, want 123", got)
+	}
+
+	got, err = fwmarkFromFlag(0, "darwin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 0 {
+		t.Fatalf("fwmarkFromFlag zero = %d, want 0", got)
+	}
+
+	if _, err := fwmarkFromFlag(123, "darwin"); err == nil {
+		t.Fatal("expected non-Linux fwmark error")
+	}
+}
+
 func TestStdioAddr(t *testing.T) {
 	if !isStdioAddr("stdio") {
 		t.Fatal("stdio should enable stdio mode")
