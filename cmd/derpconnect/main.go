@@ -29,8 +29,6 @@ var (
 	fwmark       = flag.Uint("fwmark", 0, "Linux only: set SO_MARK on outgoing TCP connections to DERP servers")
 )
 
-var derpDialRetryInterval = time.Second
-
 const keyEnvVar = "DERPCONNECT_X25519_PRIVATE_KEY"
 
 func main() {
@@ -122,9 +120,7 @@ You can find Tailscale hosted DERP server from https://login.tailscale.com/derpm
 			log.Printf("Monitoring DERP servers: %s", strings.Join(derpServers, ","))
 			log.Printf("Client public key: %v", base64.RawURLEncoding.EncodeToString(clientPubKey))
 			if err := pipeStdio(func() (net.Conn, error) {
-				return dialWhenDERPAvailable(func() (net.Conn, error) {
-					return d.Dial(pubkey)
-				})
+				return d.Dial(pubkey)
 			}, os.Stdin, os.Stdout); err != nil {
 				log.Fatalf("stdio pipe failed: %v", err)
 			}
@@ -134,9 +130,7 @@ You can find Tailscale hosted DERP server from https://login.tailscale.com/derpm
 		log.Printf("Monitoring DERP servers: %s", strings.Join(derpServers, ","))
 		log.Printf("Client public key: %v", base64.RawURLEncoding.EncodeToString(clientPubKey))
 		proxyConn(l, func() (net.Conn, error) {
-			return dialWhenDERPAvailable(func() (net.Conn, error) {
-				return d.Dial(pubkey)
-			})
+			return d.Dial(pubkey)
 		})
 	case "internaltest":
 		internalTesting(derpServers[0])
@@ -215,27 +209,6 @@ func pipeStdio(dial func() (net.Conn, error), stdin io.Reader, stdout io.Writer)
 		return err
 	}
 	return pipeConn(stdin, stdout, conn)
-}
-
-func dialWhenDERPAvailable(dial func() (net.Conn, error)) (net.Conn, error) {
-	var logged bool
-	for {
-		conn, err := dial()
-		if err == nil {
-			if logged {
-				log.Printf("DERP server available; connected stream")
-			}
-			return conn, nil
-		}
-		if !derpnet.IsNoAvailableDERP(err) {
-			return nil, err
-		}
-		if !logged {
-			log.Printf("No DERP servers available yet; waiting")
-			logged = true
-		}
-		time.Sleep(derpDialRetryInterval)
-	}
 }
 
 type copyResult struct {

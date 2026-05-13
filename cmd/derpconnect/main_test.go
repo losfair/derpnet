@@ -9,9 +9,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/ntnj/derpnet"
 )
 
 func TestListenAddr(t *testing.T) {
@@ -108,43 +105,6 @@ func TestPipeConnCopiesStdioToStreamAndStreamToStdout(t *testing.T) {
 	}
 }
 
-func TestDialWhenDERPAvailableRetriesUntilAvailable(t *testing.T) {
-	restoreRetryInterval := setTestDialRetryInterval(t)
-	defer restoreRetryInterval()
-
-	var attempts int
-	client, server := net.Pipe()
-	defer server.Close()
-
-	conn, err := dialWhenDERPAvailable(func() (net.Conn, error) {
-		attempts++
-		if attempts < 3 {
-			return nil, derpnet.ErrNoAvailableDERP
-		}
-		return client, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if attempts != 3 {
-		t.Fatalf("dial attempts = %d, want 3", attempts)
-	}
-}
-
-func TestDialWhenDERPAvailableReturnsOtherErrors(t *testing.T) {
-	restoreRetryInterval := setTestDialRetryInterval(t)
-	defer restoreRetryInterval()
-
-	want := io.ErrUnexpectedEOF
-	_, err := dialWhenDERPAvailable(func() (net.Conn, error) {
-		return nil, want
-	})
-	if err != want {
-		t.Fatalf("dialWhenDERPAvailable error = %v, want %v", err, want)
-	}
-}
-
 func TestParseDERPServers(t *testing.T) {
 	got, err := parseDERPServers("derp1.example.com, derp2.example.com:8443,,derp3.example.com")
 	if err != nil {
@@ -224,14 +184,5 @@ func TestGetKeyRejectsInvalidEnv(t *testing.T) {
 
 	if _, err := getKey(); err == nil {
 		t.Fatal("expected invalid key error")
-	}
-}
-
-func setTestDialRetryInterval(t *testing.T) func() {
-	t.Helper()
-	old := derpDialRetryInterval
-	derpDialRetryInterval = time.Millisecond
-	return func() {
-		derpDialRetryInterval = old
 	}
 }

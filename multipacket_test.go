@@ -167,19 +167,43 @@ func TestMultiPacketConnWriteToFallsBackAfterDetectedClose(t *testing.T) {
 	}
 }
 
-func TestIsNoAvailableDERP(t *testing.T) {
-	c := testMultiPacketConn()
+func TestMultiPacketConnWriteToWaitsUntilDERPAvailable(t *testing.T) {
+	c := testMultiPacketConn(nil)
 	defer c.Close()
 
-	_, err := c.WriteTo([]byte("hello"), Addr("peer"))
-	if err == nil {
-		t.Fatal("expected no available DERP error")
+	done := make(chan error, 1)
+	go func() {
+		n, err := c.WriteTo([]byte("hello"), Addr("peer"))
+		if err != nil {
+			done <- err
+			return
+		}
+		if n != len("hello") {
+			done <- errors.New("short write")
+			return
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("WriteTo returned before a DERP server was available: %v", err)
+	case <-time.After(10 * time.Millisecond):
 	}
-	if !IsNoAvailableDERP(err) {
-		t.Fatalf("IsNoAvailableDERP(%v) = false, want true", err)
+
+	available := newFakePacketConn()
+	c.setConn(0, available)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WriteTo did not complete after a DERP server became available")
 	}
-	if IsNoAvailableDERP(errors.New("other error")) {
-		t.Fatal("IsNoAvailableDERP returned true for unrelated error")
+	if got := available.writeCount(); got != 1 {
+		t.Fatalf("available DERP write count = %d, want 1", got)
 	}
 }
 
@@ -277,13 +301,16 @@ func testMultiPacketConn(conns ...net.PacketConn) *multiPacketConn {
 	for i, conn := range conns {
 		slots[i] = derpSlot{server: string(rune('a' + i)), conn: conn}
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &multiPacketConn{
-		slots:   slots,
-		peers:   make(map[string]int),
-		recvCh:  make(chan packetRead, 10),
-		recvT:   time.NewTimer(time.Hour),
-		closeCh: make(chan struct{}),
-		cancel:  func() {},
+		slots:          slots,
+		peers:          make(map[string]int),
+		recvCh:         make(chan packetRead, 10),
+		recvT:          time.NewTimer(time.Hour),
+		ctx:            ctx,
+		cancel:         cancel,
+		closeCh:        make(chan struct{}),
+		availabilityCh: make(chan struct{}),
 	}
 }
 

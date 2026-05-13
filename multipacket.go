@@ -17,16 +17,6 @@ import (
 
 var derpReconnectInterval = 5 * time.Second
 
-// ErrNoAvailableDERP means no monitored DERP server is currently connected.
-// ListenPacketAll keeps reconnecting in the background after this error.
-var ErrNoAvailableDERP = errors.New("no available DERP servers")
-
-// IsNoAvailableDERP reports whether err means no monitored DERP server is
-// currently connected. ListenPacketAll keeps reconnecting in the background.
-func IsNoAvailableDERP(err error) bool {
-	return errors.Is(err, ErrNoAvailableDERP)
-}
-
 type listenPacketFunc func(context.Context, string, Key) (net.PacketConn, error)
 
 // ListenPacketAll connects to multiple DERP servers with the provided private key.
@@ -56,7 +46,8 @@ type multiPacketConn struct {
 	closeCh   chan struct{}
 	closeOnce sync.Once
 
-	mu sync.RWMutex
+	mu             sync.RWMutex
+	availabilityCh chan struct{}
 }
 
 type derpSlot struct {
@@ -82,16 +73,17 @@ func newMultiPacketConn(ctx context.Context, derpURLs []string, key Key, dial li
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	c := &multiPacketConn{
-		key:     Key(append([]byte(nil), key...)),
-		pub:     [32]byte(pub),
-		dial:    dial,
-		slots:   make([]derpSlot, len(derpURLs)),
-		peers:   make(map[string]int),
-		recvCh:  make(chan packetRead, 10),
-		recvT:   time.NewTimer(time.Duration(math.MaxInt64)),
-		ctx:     ctx,
-		cancel:  cancel,
-		closeCh: make(chan struct{}),
+		key:            Key(append([]byte(nil), key...)),
+		pub:            [32]byte(pub),
+		dial:           dial,
+		slots:          make([]derpSlot, len(derpURLs)),
+		peers:          make(map[string]int),
+		recvCh:         make(chan packetRead, 10),
+		recvT:          time.NewTimer(time.Duration(math.MaxInt64)),
+		ctx:            ctx,
+		cancel:         cancel,
+		closeCh:        make(chan struct{}),
+		availabilityCh: make(chan struct{}),
 	}
 	for i, derpURL := range derpURLs {
 		c.slots[i].server = derpURL
@@ -158,6 +150,7 @@ func (c *multiPacketConn) setConn(i int, conn net.PacketConn) {
 		old.Close()
 	}
 	c.slots[i].conn = conn
+	c.notifyAvailabilityChangeLocked()
 }
 
 func (c *multiPacketConn) clearConn(i int, conn net.PacketConn) {
@@ -165,6 +158,7 @@ func (c *multiPacketConn) clearConn(i int, conn net.PacketConn) {
 	defer c.mu.Unlock()
 	if c.slots[i].conn == conn {
 		c.slots[i].conn = nil
+		c.notifyAvailabilityChangeLocked()
 	}
 }
 
@@ -213,50 +207,106 @@ func (c *multiPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if addr.Network() != "derp" {
 		return 0, fmt.Errorf("unsupported protocol: %v", addr.Network())
 	}
+	for {
+		n, unavailable, err := c.writeToAvailableDERP(p, addr)
+		if err != nil {
+			return 0, err
+		}
+		if !unavailable {
+			return n, nil
+		}
+		if err := c.waitForAvailableDERP(); err != nil {
+			return 0, err
+		}
+	}
+}
+
+func (c *multiPacketConn) writeToAvailableDERP(p []byte, addr net.Addr) (n int, unavailable bool, err error) {
 	var errs []error
 	preferred, hasPreferred := c.preferredSlot(addr)
 	if hasPreferred {
-		n, err := c.writeToSlot(preferred, p, addr)
-		if err == nil {
-			return n, nil
-		}
-		if !errors.Is(err, ErrNoAvailableDERP) {
+		n, unavailable, err := c.writeToSlot(preferred, p, addr)
+		if err != nil {
 			errs = append(errs, err)
+		}
+		if !unavailable && err == nil {
+			return n, false, nil
 		}
 	}
 	for i := range c.slots {
 		if hasPreferred && i == preferred {
 			continue
 		}
-		n, err := c.writeToSlot(i, p, addr)
-		if err == nil {
-			return n, nil
-		}
-		if !errors.Is(err, ErrNoAvailableDERP) {
+		n, unavailable, err := c.writeToSlot(i, p, addr)
+		if err != nil {
 			errs = append(errs, err)
+		}
+		if !unavailable && err == nil {
+			return n, false, nil
 		}
 	}
 	if len(errs) > 0 {
-		return 0, errors.Join(errs...)
+		return 0, false, errors.Join(errs...)
 	}
-	return 0, ErrNoAvailableDERP
+	return 0, true, nil
 }
 
-func (c *multiPacketConn) writeToSlot(i int, p []byte, addr net.Addr) (n int, err error) {
+func (c *multiPacketConn) waitForAvailableDERP() error {
+	c.mu.RLock()
+	if c.hasAvailableDERPLocked() {
+		c.mu.RUnlock()
+		return nil
+	}
+	availabilityCh := c.availabilityCh
+	c.mu.RUnlock()
+
+	select {
+	case <-availabilityCh:
+		return nil
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	case <-c.closeCh:
+		return net.ErrClosed
+	}
+}
+
+func (c *multiPacketConn) hasAvailableDERPLocked() bool {
+	for i := range c.slots {
+		if c.slots[i].conn != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *multiPacketConn) notifyAvailabilityChangeLocked() {
+	if c.availabilityCh == nil {
+		c.availabilityCh = make(chan struct{})
+		return
+	}
+	select {
+	case <-c.availabilityCh:
+	default:
+		close(c.availabilityCh)
+	}
+	c.availabilityCh = make(chan struct{})
+}
+
+func (c *multiPacketConn) writeToSlot(i int, p []byte, addr net.Addr) (n int, unavailable bool, err error) {
 	if i < 0 || i >= len(c.slots) {
-		return 0, ErrNoAvailableDERP
+		return 0, true, nil
 	}
 	conn := c.conn(i)
 	if conn == nil {
-		return 0, ErrNoAvailableDERP
+		return 0, true, nil
 	}
 	n, err = conn.WriteTo(p, addr)
 	if err == nil {
-		return n, nil
+		return n, false, nil
 	}
 	c.clearConn(i, conn)
 	conn.Close()
-	return 0, fmt.Errorf("%s: %w", c.slots[i].server, err)
+	return 0, false, fmt.Errorf("%s: %w", c.slots[i].server, err)
 }
 
 func (c *multiPacketConn) rememberIngressSlot(i int, addr net.Addr) {
@@ -301,6 +351,7 @@ func (c *multiPacketConn) Close() error {
 			}
 			c.slots[i].conn = nil
 		}
+		c.notifyAvailabilityChangeLocked()
 	})
 	return err
 }
